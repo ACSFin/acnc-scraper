@@ -13,8 +13,11 @@ const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.SCRAPER_TOKEN || "changeme";
 
 // Timeouts (ms) — adjust in Render if needed
-const HTTP_TIMEOUT_MS = parseInt(process.env.ACNC_HTTP_TIMEOUT_MS || "20000", 10);   // HTML GETs
-const NAV_TIMEOUT_MS  = parseInt(process.env.ACNC_NAV_TIMEOUT_MS  || "25000", 10);   // page.goto
+const HTTP_TIMEOUT_MS = parseInt(process.env.ACNC_HTTP_TIMEOUT_MS || "120000", 10);   // HTML GETs
+const NAV_TIMEOUT_MS  = parseInt(process.env.ACNC_NAV_TIMEOUT_MS  || "120000", 10);   // page.goto
+
+// Optional: log what the server actually resolved (helps verify env is applied)
+console.log(`[ACNC] Timeouts -> HTTP=${HTTP_TIMEOUT_MS}ms, NAV=${NAV_TIMEOUT_MS}ms`);
 
 // Preview defaults; can be overridden by request body pdfText
 const PREVIEW_DEFAULT = String(process.env.SCRAPER_PREVIEW || "true").toLowerCase() !== "false";
