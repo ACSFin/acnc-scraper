@@ -1,5 +1,5 @@
 // server.js
-// ACNC financials scraper — Render Web Service (Playwright 1.55+, resilient HTTP/2/timeout fallbacks)
+// ACNC financials scraper — Render Web Service (Playwright 1.55+, resilient fallbacks)
 
 import express from "express";
 import { chromium } from "playwright";
@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.SCRAPER_TOKEN || "changeme";
 const PREVIEW = String(process.env.SCRAPER_PREVIEW || "true").toLowerCase() !== "false";
 
-// ---- Auth (apply globally; move into POST only if you want "/" public)
+// ---- Auth (global; move into POST only if you want "/" to be public)
 app.use((req, res, next) => {
   const got = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
   if (!TOKEN || got === TOKEN) return next();
@@ -38,9 +38,8 @@ async function pdfTextFromBuffer(buf) {
 }
 
 function absUrl(href, base) {
-  try {
-    return href.startsWith("http") ? href : new URL(href, base).toString();
-  } catch { return href; }
+  try { return href.startsWith("http") ? href : new URL(href, base).toString(); }
+  catch { return href; }
 }
 
 function stripTags(html) {
@@ -51,37 +50,62 @@ function stripTags(html) {
              .trim();
 }
 
+const COMMON_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml",
+  "Accept-Language": "en-AU,en;q=0.8",
+  "Referer": "https://www.acnc.gov.au/"
+};
+
+async function fetchHtml(url) {
+  const r = await fetch(url, { headers: COMMON_HEADERS });
+  if (!r.ok) throw new Error(`Fetch failed ${r.status} for ${url}`);
+  return await r.text();
+}
+
+function findCharityLink(html) {
+  // Prefer fully-qualified uuid path and either /profile or /documents
+  let m = html.match(/href="([^"]*\/charity\/charities\/[0-9a-f-]{36}\/(?:profile|documents)\/?)"/i);
+  if (m) return m[1];
+  // Fallbacks
+  m = html.match(/href="([^"]*\/charity\/charities\/[^"']+?\/profile\/?)"/i)
+    || html.match(/href="([^"]*\/charity\/charities\/[^"']+?)"/i);
+  return m ? m[1] : null;
+}
+
+// If direct /documents stalls, click the FINANCIALS & DOCUMENTS tab
+async function maybeClickDocsTab(page) {
+  const docsTabSelectors = [
+    'a:has-text("FINANCIALS & DOCUMENTS")',
+    'button:has-text("FINANCIALS & DOCUMENTS")',
+    'a[role="tab"]:has-text("FINANCIALS & DOCUMENTS")'
+  ];
+  for (const sel of docsTabSelectors) {
+    const el = page.locator(sel).first();
+    if (await el.isVisible().catch(() => false)) {
+      await Promise.all([page.waitForLoadState("domcontentloaded"), el.click()]);
+      await page.waitForLoadState("networkidle").catch(()=>{});
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- HTTP-only fallback (no Playwright navigation)
 async function scrapeViaHttpOnly(abn) {
   const searchUrl = `https://www.acnc.gov.au/charity/charities?search=${abn}`;
-  const r = await fetch(searchUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml"
-    }
-  });
-  if (!r.ok) throw new Error(`Search fetch failed: ${r.status}`);
-  const searchHtml = await r.text();
+  const searchHtml = await fetchHtml(searchUrl);
 
-  // First charity link
-  let m = searchHtml.match(/href="([^"]*\/charity\/charities\/[^"']+?\/profile\/?)"/i)
-       || searchHtml.match(/href="([^"]*\/charity\/charities\/[^"']+?)"/i);
-  if (!m) throw new Error("No charity link found in search HTML");
-  const firstLink = absUrl(m[1], "https://www.acnc.gov.au");
+  const rawLink = findCharityLink(searchHtml);
+  if (!rawLink) throw new Error("No charity link found in search HTML");
+  const firstLink = absUrl(rawLink, "https://www.acnc.gov.au");
 
   // Go straight to /documents/
   const u = new URL(firstLink);
   u.pathname = u.pathname.replace(/\/profile\/?$/, "/documents/");
-  const r2 = await fetch(u.toString(), {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml"
-    }
-  });
-  if (!r2.ok) throw new Error(`Documents fetch failed: ${r2.status}`);
-  const docHtml = await r2.text();
+  const docHtml = await fetchHtml(u.toString());
 
-  // Extract table rows (very lightweight parsing)
+  // Extract table rows
   const rows = [...docHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
   const docs = [];
   for (const row of rows) {
@@ -90,7 +114,7 @@ async function scrapeViaHttpOnly(abn) {
     const titleText = stripTags(titleCell || "");
     if (!titleText) continue;
 
-    // Any link in row; prefer .pdf or obvious download/view links
+    // Prefer PDF links, else any Download/View/AIS link, else first link
     const linkMatch =
       inner.match(/<a[^>]+href="([^"]+\.pdf)"[^>]*>/i) ||
       inner.match(/<a[^>]+href="([^"]+)"[^>]*>(?:\s*(?:download|view|ais)[^<]*)<\/a>/i) ||
@@ -163,14 +187,14 @@ app.post("/fetchAcncFinancials", async (req, res) => {
   const ctx = await browser.newContext({
     locale: "en-AU",
     ignoreHTTPSErrors: true,
-    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    userAgent: COMMON_HEADERS["User-Agent"]
   });
   const page = await ctx.newPage();
 
   try {
     const searchUrl = `https://www.acnc.gov.au/charity/charities?search=${abn}`;
 
-    // Helper: fast commit-level nav, then wait for table
+    // Helper: fast commit-level nav then DOM readiness
     async function gotoWithCommit(url) {
       await page.goto(url, { waitUntil: "commit", timeout: 30000 });
       await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(()=>{});
@@ -178,10 +202,9 @@ app.post("/fetchAcncFinancials", async (req, res) => {
 
     let usedHttpFallback = false;
 
-    // Try primary nav
+    // Try primary nav to the search page
     try {
       await gotoWithCommit(searchUrl);
-      // wait for some results; don't hard fail if they render slowly
       await page.locator("table tbody tr").first().waitFor({ timeout: 15000 }).catch(()=>{});
     } catch (e) {
       console.warn("[ACNC] primary nav error", e?.message || e);
@@ -195,7 +218,7 @@ app.post("/fetchAcncFinancials", async (req, res) => {
       const out = await scrapeViaHttpOnly(abn);
       docs = out.docs; latestAis = out.latestAis; latestFr = out.latestFr; frTextPreview = out.frTextPreview; detailUrl = out.detailUrl;
     } else {
-      // We’re on the search results; click into the correct charity then go to documents
+      // We’re on search results; click into the correct charity then go to documents
       const spaced = spaceAbn(abn);
       let link = page
         .locator("table tbody tr")
@@ -210,9 +233,20 @@ app.post("/fetchAcncFinancials", async (req, res) => {
       await link.waitFor({ timeout: 20000 });
       await Promise.all([page.waitForLoadState("networkidle"), link.click()]);
 
+      // Direct to /documents
       const u = new URL(page.url());
       u.pathname = u.pathname.replace(/\/profile\/?$/, "/documents/");
-      await page.goto(u.toString(), { waitUntil: "networkidle", timeout: 60000 });
+      await page.goto(u.toString(), { waitUntil: "networkidle", timeout: 60000 }).catch(()=>{});
+
+      // If the table didn't appear, try clicking the tab explicitly
+      const firstRow = page.locator("table tbody tr").first();
+      if (!(await firstRow.isVisible().catch(()=>false))) {
+        const clicked = await maybeClickDocsTab(page);
+        if (!clicked) {
+          // If still no tab, try a lighter wait
+          await page.waitForLoadState("domcontentloaded").catch(()=>{});
+        }
+      }
 
       // Scrape rows on documents page
       const rows = page.locator("table tbody tr");
@@ -246,7 +280,7 @@ app.post("/fetchAcncFinancials", async (req, res) => {
         docs.push({ year, type, source_url: url, title });
       }
 
-      latestAis = docs.filter(d => d.type === "AIS" && Number.isInteger(d.year)).sort((a,b)=>b.year-a.year)[0] || null;
+      latestAis = docs.filter(d => d.type === "AIS" && Number.isInteger(d.year)).sort((a,b)=>b.year-a-year)[0] || null;
       latestFr  = docs.filter(d => d.type === "Financial Report" && Number.isInteger(d.year)).sort((a,b)=>b.year-a.year)[0] || null;
 
       // Optional preview
