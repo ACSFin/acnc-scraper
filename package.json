@@ -2,13 +2,11 @@
   "name": "acnc-scraper",
   "private": true,
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "playwright": "^1.45.0",
+    "playwright": "1.55.0",
     "pdfjs-dist": "^4.7.76"
   }
 }
